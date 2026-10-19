@@ -14,6 +14,7 @@ import hmac
 import base64
 import zlib
 import unicodedata
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from datetime import date, time, datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -64,18 +65,37 @@ def _segredo(nome, padrao=''):
 
 def _gh_config():
  token=_segredo('GITHUB_TOKEN')
- repo=_segredo('GITHUB_DATA_REPO')
- if not token or not repo:
-  raise RuntimeError('Configure GITHUB_TOKEN e GITHUB_DATA_REPO nos Secrets. O repositório de dados deve ser separado e PRIVADO.')
+ repo=_segredo('GITHUB_REPO', 'anaflav06/ocorrencia-de-ponto')
+ senha=_segredo('APP_PASSWORD')
+ if not token or not senha:
+  raise RuntimeError('Configure APP_PASSWORD e GITHUB_TOKEN nos Secrets.')
  if repo.count('/') != 1:
-  raise RuntimeError('GITHUB_DATA_REPO deve ter formato usuario/repositorio.')
- if repo.lower() == 'anaflav06/ocorrencia-de-ponto':
-  raise RuntimeError('Segurança: não é permitido salvar dados no repositório público do aplicativo.')
- # Verificação no GitHub: não confiar apenas no nome ou no que o usuário informou.
+  raise RuntimeError('GITHUB_REPO deve ter formato usuario/repositorio.')
+ if repo.lower() != 'anaflav06/ocorrencia-de-ponto':
+  raise RuntimeError('Repositório inesperado. Confira GITHUB_REPO nos Secrets.')
  info=_gh_request('GET',f'https://api.github.com/repos/{repo}',token)
- if not info or info.get('private') is not True:
-  raise RuntimeError('Armazenamento bloqueado: o repositório de dados precisa existir e estar PRIVADO no GitHub.')
+ if not info:
+  raise RuntimeError('Não foi possível acessar o repositório. Confira o token e as permissões Contents: Read and write.')
  return token,repo
+
+# Protege o banco ANTES de enviá-lo ao GitHub público. A chave é derivada
+# dos Secrets já existentes, sem DB_ENCRYPTION_KEY adicional.
+# ATENÇÃO: alterar o token ou a senha sem migrar o banco impede sua leitura.
+def _chave_db(token):
+ senha=_segredo('APP_PASSWORD')
+ return hashlib.pbkdf2_hmac('sha256', (token + '\x00' + senha).encode(), b'GDS-PONTO-PUBLICO-DB-v1', 260000, dklen=32)
+
+def _criptografar_db(raw,token):
+ nonce=os.urandom(12)
+ return b'GDSENC01'+nonce+AESGCM(_chave_db(token)).encrypt(nonce,raw,b'GDS-OCORRENCIA-PONTO')
+
+def _descriptografar_db(payload,token):
+ if not payload.startswith(b'GDSENC01') or len(payload)<37:
+  raise RuntimeError('Banco remoto não está criptografado no formato esperado. Nenhum dado foi sobrescrito.')
+ try:
+  return AESGCM(_chave_db(token)).decrypt(payload[8:20],payload[20:],b'GDS-OCORRENCIA-PONTO')
+ except Exception as exc:
+  raise RuntimeError('Não foi possível abrir o banco protegido. Confira se o token e APP_PASSWORD são os mesmos usados ao salvar. Não sobrescreva o banco.') from exc
 
 def _gh_request(method,url,token,data=None):
  headers={'Authorization':f'Bearer {token}','Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28','User-Agent':'gds-ocorrencia-ponto'}
@@ -93,7 +113,7 @@ def _gh_request(method,url,token,data=None):
 
 def _gh_url(repo):
  from urllib.parse import quote
- return f'https://api.github.com/repos/{quote(repo,safe="/")}/contents/dados/ocorrencia_ponto.sqlite3'
+ return f'https://api.github.com/repos/{quote(repo,safe="/")}/contents/dados/ocorrencia_ponto.sqlite3.enc'
 
 def _baixar_db(token,repo):
  info=_gh_request('GET',_gh_url(repo),token)
@@ -101,10 +121,10 @@ def _baixar_db(token,repo):
  if info.get('type')!='file': raise RuntimeError('Arquivo de dados remoto inválido.')
  # Download pelo endpoint de conteúdo, que fornece base64.
  payload=base64.b64decode(info['content'].replace('\n',''))
- return payload,info['sha']
+ return _descriptografar_db(payload,token),info['sha']
 
 def _enviar_db(token,repo,raw,sha):
- dados={'message':'Atualizar base de ocorrências GDS','content':base64.b64encode(raw).decode('ascii')}
+ dados={'message':'Atualizar base de ocorrências GDS','content':base64.b64encode(_criptografar_db(raw,token)).decode('ascii')}
  if sha: dados['sha']=sha
  return _gh_request('PUT',_gh_url(repo),token,dados)
 
@@ -708,4 +728,4 @@ else:
   st.download_button('⬇️ Baixar PDF A4',st.session_state['pdf_gerado'],file_name='GDS_ocorrencia_de_ponto.pdf',mime='application/pdf',type='primary',use_container_width=True)
 
 st.divider()
-st.caption('Persistência: banco em repositório GitHub privado. Dados sincronizados em cada operação.')
+st.caption('Persistência: banco criptografado no GitHub. Acesso protegido pelos Secrets; dados sincronizados em cada operação.')

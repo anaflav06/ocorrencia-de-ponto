@@ -3,6 +3,13 @@ import io
 import os
 import re
 import sqlite3
+import json
+import urllib.request
+import urllib.error
+import threading
+import tempfile
+from contextlib import contextmanager
+from cryptography.fernet import Fernet, InvalidToken
 import hashlib
 import hmac
 import base64
@@ -48,15 +55,93 @@ def empresa_normalizada(v):
   if sem_acento(normal(nome))==sem_acento(n): return nome
  return n
 
+# Armazenamento persistente: snapshot SQLite criptografado em repositório PRIVADO.
+# Nunca envie dados pessoais em texto puro ao GitHub.
+_GH_LOCK = threading.RLock()
+
+def _segredo(nome, padrao=''):
+ try: return str(st.secrets.get(nome, os.getenv(nome, padrao))).strip()
+ except Exception: return str(os.getenv(nome, padrao)).strip()
+
+def _gh_config():
+ token=_segredo('GITHUB_TOKEN')
+ repo=_segredo('GITHUB_REPO')
+ key=_segredo('DB_ENCRYPTION_KEY')
+ if not (token and repo and key):
+  raise RuntimeError('Configure GITHUB_TOKEN, GITHUB_REPO e DB_ENCRYPTION_KEY nos Secrets para ativar o armazenamento persistente.')
+ if '/' not in repo or repo.count('/') != 1:
+  raise RuntimeError('GITHUB_REPO deve ter o formato usuario/repositorio.')
+ try: cipher=Fernet(key.encode())
+ except Exception as exc: raise RuntimeError('DB_ENCRYPTION_KEY inválida: gere uma chave Fernet.') from exc
+ return token,repo,cipher
+
+def _gh_request(method,url,token,data=None):
+ headers={'Authorization':f'Bearer {token}','Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28','User-Agent':'gds-ocorrencia-ponto'}
+ if data is not None:
+  headers['Content-Type']='application/json'
+  data=json.dumps(data).encode('utf-8')
+ req=urllib.request.Request(url,data=data,headers=headers,method=method)
+ try:
+  with urllib.request.urlopen(req,timeout=25) as response:
+   return json.loads(response.read().decode('utf-8'))
+ except urllib.error.HTTPError as exc:
+  if exc.code==404 and method=='GET': return None
+  if exc.code in (409,422): raise RuntimeError('Conflito ao salvar no GitHub. Recarregue o aplicativo e repita a operação.') from exc
+  raise RuntimeError(f'GitHub retornou HTTP {exc.code}. Verifique token, repositório privado e permissões.') from exc
+
+def _gh_url(repo):
+ from urllib.parse import quote
+ return f'https://api.github.com/repos/{quote(repo,safe="/")}/contents/dados/ocorrencia_ponto.sqlite3.enc'
+
+def _baixar_db(token,repo,cipher):
+ info=_gh_request('GET',_gh_url(repo),token)
+ if info is None: return None,None
+ if info.get('type')!='file': raise RuntimeError('Arquivo de dados remoto inválido.')
+ # Download pelo endpoint de conteúdo, que fornece base64.
+ payload=base64.b64decode(info['content'].replace('\n',''))
+ try: raw=cipher.decrypt(payload)
+ except InvalidToken as exc: raise RuntimeError('Chave de criptografia incorreta. O banco remoto não pode ser aberto.') from exc
+ return raw,info['sha']
+
+def _enviar_db(token,repo,cipher,raw,sha):
+ dados={'message':'Atualizar base criptografada de ocorrências GDS','content':base64.b64encode(cipher.encrypt(raw)).decode('ascii')}
+ if sha: dados['sha']=sha
+ return _gh_request('PUT',_gh_url(repo),token,dados)
+
+@contextmanager
 def conectar():
- DB.parent.mkdir(parents=True,exist_ok=True)
- con=sqlite3.connect(str(DB),timeout=30)
- con.execute('PRAGMA journal_mode=WAL')
- con.execute('CREATE TABLE IF NOT EXISTS colaboradores (nome TEXT PRIMARY KEY, cargo TEXT, cpf TEXT, empresa TEXT, ativo INTEGER DEFAULT 1, origem TEXT DEFAULT \'planilha\')')
- con.execute('CREATE TABLE IF NOT EXISTS configuracoes (chave TEXT PRIMARY KEY, valor TEXT)')
- con.execute('CREATE TABLE IF NOT EXISTS importacoes (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT, arquivo TEXT, total INTEGER, ativos INTEGER)')
- con.commit()
- return con
+ # Uma execução por vez no processo; cada operação relê a versão remota.
+ with _GH_LOCK:
+  token,repo,cipher=_gh_config()
+  raw,sha=_baixar_db(token,repo,cipher)
+  with tempfile.TemporaryDirectory(prefix='gds_db_') as temp:
+   local=Path(temp)/'ponto.sqlite3'
+   if raw is not None: local.write_bytes(raw)
+   con=sqlite3.connect(str(local),timeout=30)
+   try:
+    con.execute("CREATE TABLE IF NOT EXISTS colaboradores (nome TEXT PRIMARY KEY, cargo TEXT, cpf TEXT, empresa TEXT, ativo INTEGER DEFAULT 1, origem TEXT DEFAULT 'planilha')")
+    con.execute('CREATE TABLE IF NOT EXISTS configuracoes (chave TEXT PRIMARY KEY, valor TEXT)')
+    con.execute('CREATE TABLE IF NOT EXISTS importacoes (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT, arquivo TEXT, total INTEGER, ativos INTEGER)')
+    con.commit()
+    before=local.read_bytes()
+    try:
+     yield con
+     con.commit()
+    except BaseException:
+     con.rollback()
+     raise
+    finally:
+     con.close()
+    after=local.read_bytes()
+    if after!=before or raw is None:
+     # Detecta edições remotas simultâneas antes de sobrescrever.
+     current=_gh_request('GET',_gh_url(repo),token)
+     remote_sha=current['sha'] if current else None
+     if remote_sha!=sha: raise RuntimeError('Outro usuário atualizou os dados. Recarregue e repita para evitar perda de informações.')
+     _enviar_db(token,repo,cipher,after,sha)
+   finally:
+    try: con.close()
+    except Exception: pass
 
 def importar(dados,arquivo):
  col={normal(x):x for x in dados.columns}
@@ -623,4 +708,4 @@ else:
   st.download_button('⬇️ Baixar PDF A4',st.session_state['pdf_gerado'],file_name='GDS_ocorrencia_de_ponto.pdf',mime='application/pdf',type='primary',use_container_width=True)
 
 st.divider()
-st.caption('Persistência: SQLite local (GDS_DB_PATH). No Streamlit Community Cloud, esse armazenamento pode ser apagado em reinicializações. Configure persistência externa antes de usar em produção.')
+st.caption('Persistência: banco criptografado em repositório GitHub privado. Dados sincronizados em cada operação.')
